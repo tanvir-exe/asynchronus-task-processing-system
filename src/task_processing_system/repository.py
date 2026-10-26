@@ -34,6 +34,13 @@ CANCELLED = TaskStatus.CANCELLED.value
 
 CancelOutcome = Literal["cancelled", "not_found", "not_cancellable"]
 
+# Columns the API returns for status/list/cancel. payload and result are
+# deliberately left out: they can be ~1 MB each, and parsing them on the event
+# loop for a response that never includes them freezes the server.
+SUMMARY_COLUMNS = (
+    "id, idempotency_key, type, status, error, created_at, started_at, completed_at"
+)
+
 
 class IdempotencyConflictError(Exception):
     """The idempotency key was already used with a different request body."""
@@ -69,14 +76,19 @@ def compute_request_hash(task_type: Any, payload: dict[str, Any]) -> str:
 
 def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
     task = dict(row)
-    task["payload"] = json.loads(task["payload"])
-    if task["result"] is not None:
+    # Only parse the JSON columns that were actually selected.
+    if task.get("payload") is not None:
+        task["payload"] = json.loads(task["payload"])
+    if task.get("result") is not None:
         task["result"] = json.loads(task["result"])
     return task
 
 
-async def _fetch(conn: Any, task_id: str) -> dict[str, Any] | None:
-    cursor = await conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+async def _fetch(
+    conn: Any, task_id: str, columns: str = SUMMARY_COLUMNS
+) -> dict[str, Any] | None:
+    # `columns` only ever comes from constants in this file, never user input.
+    cursor = await conn.execute(f"SELECT {columns} FROM tasks WHERE id = ?", (task_id,))
     row = await cursor.fetchone()
     return _row_to_task(row) if row else None
 
@@ -126,7 +138,8 @@ async def create_task(
             if idempotency_key is None:
                 raise
             cursor = await conn.execute(
-                "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
+                f"SELECT request_hash, {SUMMARY_COLUMNS} FROM tasks WHERE idempotency_key = ?",
+                (idempotency_key,),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -141,8 +154,15 @@ async def create_task(
 
 
 async def get_task(task_id: str) -> dict[str, Any] | None:
+    """Task summary (no payload or result)."""
     async with get_connection() as conn:
         return await _fetch(conn, task_id)
+
+
+async def get_task_result(task_id: str) -> dict[str, Any] | None:
+    """Task summary plus the parsed result. Used only by /tasks/{id}/result."""
+    async with get_connection() as conn:
+        return await _fetch(conn, task_id, f"{SUMMARY_COLUMNS}, result")
 
 
 async def list_tasks(
@@ -166,7 +186,8 @@ async def list_tasks(
         cursor = await conn.execute(f"SELECT COUNT(*) FROM tasks {where}", params)
         total = (await cursor.fetchone())[0]
         cursor = await conn.execute(
-            f"SELECT * FROM tasks {where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            f"SELECT {SUMMARY_COLUMNS} FROM tasks {where} "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
             [*params, limit, offset],
         )
         rows = await cursor.fetchall()
@@ -192,7 +213,8 @@ async def claim_task(task_id: str) -> dict[str, Any] | None:
         await conn.commit()
         if cursor.rowcount != 1:
             return None
-        return await _fetch(conn, task_id)
+        # The worker is the one caller that needs the payload.
+        return await _fetch(conn, task_id, f"{SUMMARY_COLUMNS}, payload")
 
 
 async def cancel_task(task_id: str) -> tuple[CancelOutcome, dict[str, Any] | None]:

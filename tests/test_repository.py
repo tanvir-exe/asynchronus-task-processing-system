@@ -20,9 +20,9 @@ async def test_create_task_defaults(db):
     assert created is True
     assert task["status"] == "pending"
     assert task["type"] == TEXT
-    assert task["payload"] == {"text": "hello"}
-    assert task["result"] is None
     assert task["started_at"] is None
+    # Large columns are not loaded for summaries.
+    assert "payload" not in task and "result" not in task
     assert len(task["id"]) == 36
 
 
@@ -74,8 +74,39 @@ async def test_concurrent_requests_with_same_key_create_one_task(db):
 async def test_get_task(db):
     task, _ = await make({"text": "abc"})
     fetched = await repo.get_task(task["id"])
-    assert fetched["payload"] == {"text": "abc"}
+    assert fetched["id"] == task["id"]
+    assert fetched["status"] == "pending"
     assert await repo.get_task("does-not-exist") is None
+
+
+async def test_summary_queries_do_not_load_payload_or_result(db):
+    task, _ = await make({"text": "abc"})
+    await repo.claim_task(task["id"])
+    await repo.complete_task(task["id"], {"total_words": 1})
+
+    created, _ = await make({"text": "other"}, key="k")
+    replayed, _ = await make({"text": "other"}, key="k")
+    items, _ = await repo.list_tasks()
+    outcome, cancelled = await repo.cancel_task(created["id"])
+
+    summaries = [await repo.get_task(task["id"]), created, replayed, cancelled, *items]
+    for summary in summaries:
+        assert "payload" not in summary
+        assert "result" not in summary
+
+
+async def test_get_task_result(db):
+    task, _ = await make()
+    before = await repo.get_task_result(task["id"])
+    assert before["status"] == "pending" and before["result"] is None
+
+    await repo.claim_task(task["id"])
+    await repo.complete_task(task["id"], {"total_words": 3})
+    after = await repo.get_task_result(task["id"])
+    assert after["status"] == "completed"
+    assert after["result"] == {"total_words": 3}
+    assert "payload" not in after
+    assert await repo.get_task_result("does-not-exist") is None
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +119,7 @@ async def test_claim_task_only_succeeds_once(db):
     claimed = await repo.claim_task(task["id"])
     assert claimed["status"] == "processing"
     assert claimed["started_at"] is not None
+    assert claimed["payload"] == {"text": "hello"}  # the worker needs this
     assert await repo.claim_task(task["id"]) is None
 
 
@@ -135,7 +167,7 @@ async def test_complete_task_stores_result(db):
     task, _ = await make()
     await repo.claim_task(task["id"])
     assert await repo.complete_task(task["id"], {"total_words": 3}) is True
-    done = await repo.get_task(task["id"])
+    done = await repo.get_task_result(task["id"])
     assert done["status"] == "completed"
     assert done["result"] == {"total_words": 3}
     assert done["completed_at"] is not None

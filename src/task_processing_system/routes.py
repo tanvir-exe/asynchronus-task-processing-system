@@ -93,7 +93,7 @@ async def get_task_status(task_id: str) -> Any:
 @router.get("/tasks/{task_id}/result", response_model=TaskResultResponse, tags=["tasks"])
 async def get_task_result(task_id: str) -> Any:
     """Fetch the result of a completed task (409 if it has no result yet)."""
-    task = await repo.get_task(task_id)
+    task = await repo.get_task_result(task_id)
     if task is None:
         raise _not_found(task_id)
 

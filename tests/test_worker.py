@@ -21,7 +21,7 @@ async def wait_for_status(task_id, status, timeout=5.0):
 async def test_process_task_completes_text_analysis(db):
     task, _ = await repo.create_task("text_analysis", GOOD_TEXT)
     await process_task(task["id"])
-    done = await repo.get_task(task["id"])
+    done = await repo.get_task_result(task["id"])
     assert done["status"] == "completed"
     assert done["result"]["total_words"] == 8
     assert done["started_at"] and done["completed_at"]
@@ -37,7 +37,7 @@ async def test_process_task_completes_transaction_analysis(db):
     }
     task, _ = await repo.create_task("transaction_analysis", payload)
     await process_task(task["id"])
-    done = await repo.get_task(task["id"])
+    done = await repo.get_task_result(task["id"])
     assert done["status"] == "completed"
     assert done["result"]["total_revenue"] == 10.0
     assert done["result"]["duplicate_count"] == 1
@@ -48,10 +48,10 @@ async def test_processor_error_marks_task_failed(db):
     # "transactions" is not a list, so the processor raises TypeError.
     task, _ = await repo.create_task("transaction_analysis", {"transactions": "nope"})
     await process_task(task["id"])
-    failed = await repo.get_task(task["id"])
+    failed = await repo.get_task_result(task["id"])
     assert failed["status"] == "failed"
     assert "TypeError" in failed["error"]
-    assert failed["result"] is None
+    assert failed["result"] is None  # nothing was stored for a failed task
 
 
 async def test_process_task_skips_cancelled_task(db):

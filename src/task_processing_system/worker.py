@@ -33,6 +33,13 @@ from .processors import analyze_text, analyze_transactions
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKERS = 3
+DEFAULT_STALE_AFTER_SECONDS = 0.0
+
+def _stale_after_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("TASK_STALE_AFTER_SECONDS", DEFAULT_STALE_AFTER_SECONDS)))
+    except ValueError:
+        return DEFAULT_STALE_AFTER_SECONDS
 
 
 def _run_text_analysis(payload: dict[str, Any]) -> dict[str, Any]:
@@ -101,7 +108,7 @@ class TaskWorkerPool:
 
     async def start(self) -> None:
         """Recover unfinished work from the database, then start the workers."""
-        reset = await repo.reset_stale_processing()
+        reset = await repo.reset_stale_processing(_stale_after_seconds())
         if reset:
             logger.warning("Re-queued %d task(s) interrupted by a previous shutdown", reset)
         for task_id in await repo.get_pending_ids():

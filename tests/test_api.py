@@ -4,85 +4,20 @@ Each test gets its own app instance (lifespan + workers) and its own SQLite
 file. Requests go through httpx's ASGI transport, so no real server or port
 is needed, and asyncio.gather lets us fire truly concurrent requests.
 
-Two fixtures:
+Fixtures (defined in conftest.py), all logged in as the user "alice":
   client       fast workers (3), no delay  -> tasks finish almost instantly
   slow_client  1 worker, 0.5s per task     -> tasks stay pending/processing
                                               long enough to test cancel etc.
+Login, registration and ownership tests live in test_auth.py.
 """
 
 import asyncio
 import uuid
-from contextlib import asynccontextmanager
 
-import httpx
 import pytest
 
+from api_helpers import TEXT_BODY, TRANSACTION_BODY, submit, wait_for_status
 from task_processing_system import worker as worker_module
-from task_processing_system.main import app
-
-TEXT_BODY = {
-    "type": "text_analysis",
-    "payload": {"text": "The cat sat. The cat ran away fast!"},
-}
-
-TRANSACTION_BODY = {
-    "type": "transaction_analysis",
-    "payload": {
-        "transactions": [
-            {"transaction_id": "t1", "customer_id": "alice", "amount": 100, "timestamp": "2024-01-15T10:30:00Z"},
-            {"transaction_id": "t1", "customer_id": "alice", "amount": 100, "timestamp": "2024-01-15T10:30:00Z"},
-            {"transaction_id": "t2", "customer_id": "bob", "amount": 50.5, "timestamp": "2024-01-16T09:00:00Z"},
-            {"transaction_id": "t3", "customer_id": "carol", "amount": -5, "timestamp": "2024-01-17T09:00:00Z"},
-        ]
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# Fixtures and helpers
-# ---------------------------------------------------------------------------
-
-
-@asynccontextmanager
-async def running_app(tmp_path, monkeypatch, workers, delay):
-    monkeypatch.setenv("TASKS_DB_PATH", str(tmp_path / "api.db"))
-    monkeypatch.setenv("TASK_WORKERS", str(workers))
-    monkeypatch.setenv("TASK_PROCESSING_DELAY_SECONDS", str(delay))
-    # ASGITransport does not run lifespan events, so we run them ourselves.
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-            yield http
-
-
-@pytest.fixture
-async def client(tmp_path, monkeypatch):
-    async with running_app(tmp_path, monkeypatch, workers=3, delay=0) as http:
-        yield http
-
-
-@pytest.fixture
-async def slow_client(tmp_path, monkeypatch):
-    async with running_app(tmp_path, monkeypatch, workers=1, delay=0.5) as http:
-        yield http
-
-
-async def submit(http, body=None, key=None):
-    headers = {"Idempotency-Key": key} if key is not None else {}
-    return await http.post("/tasks", json=body or TEXT_BODY, headers=headers)
-
-
-async def wait_for_status(http, task_id, status, timeout=5.0):
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while True:
-        body = (await http.get(f"/tasks/{task_id}")).json()
-        if body["status"] == status:
-            return body
-        if loop.time() > deadline:
-            raise AssertionError(f"task still {body['status']!r}, expected {status!r}")
-        await asyncio.sleep(0.02)
-
 
 # ---------------------------------------------------------------------------
 # Health
@@ -444,3 +379,62 @@ async def test_stats_after_processing(client):
     assert stats["by_status"]["completed"] == 3
     assert stats["average_processing_seconds"] is not None
     assert stats["average_processing_seconds"] >= 0
+
+# ---------------------------------------------------------------------------
+# Retry
+# ---------------------------------------------------------------------------
+
+
+async def test_retry_failed_task_then_it_succeeds(client, monkeypatch):
+    original = worker_module.PROCESSORS["text_analysis"]
+
+    def boom(payload):
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(worker_module.PROCESSORS, "text_analysis", boom)
+    task = (await submit(client)).json()
+    await wait_for_status(client, task["id"], "failed")
+
+    monkeypatch.setitem(worker_module.PROCESSORS, "text_analysis", original)  # "fixed"
+    response = await client.post(f"/tasks/{task['id']}/retry")
+    assert response.status_code == 202
+    assert response.json()["status"] == "pending"
+    assert response.json()["retry_count"] == 1
+
+    done = await wait_for_status(client, task["id"], "completed")
+    assert done["retry_count"] == 1 and done["error"] is None
+    result = await client.get(f"/tasks/{task['id']}/result")
+    assert result.status_code == 200
+    assert result.json()["result"]["total_words"] == 8
+
+
+async def test_retry_stops_after_three_attempts(client, monkeypatch):
+    def boom(payload):
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(worker_module.PROCESSORS, "text_analysis", boom)
+    task = (await submit(client)).json()
+    await wait_for_status(client, task["id"], "failed")
+
+    for expected in (1, 2, 3):
+        response = await client.post(f"/tasks/{task['id']}/retry")
+        assert response.status_code == 202
+        assert response.json()["retry_count"] == expected
+        await wait_for_status(client, task["id"], "failed")
+
+    response = await client.post(f"/tasks/{task['id']}/retry")
+    assert response.status_code == 409
+    assert "limit" in response.json()["detail"].lower()
+    assert (await client.get(f"/tasks/{task['id']}")).json()["retry_count"] == 3
+
+
+async def test_cannot_retry_a_task_that_has_not_failed(client):
+    task = (await submit(client)).json()
+    await wait_for_status(client, task["id"], "completed")
+    response = await client.post(f"/tasks/{task['id']}/retry")
+    assert response.status_code == 409
+    assert "completed" in response.json()["detail"]
+
+
+async def test_retry_unknown_task_returns_404(client):
+    assert (await client.post("/tasks/nope/retry")).status_code == 404

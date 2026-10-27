@@ -10,6 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MAX_TEXT_LENGTH = 100_000
 MAX_TRANSACTIONS = 10_000
 MAX_IDEMPOTENCY_KEY_LENGTH = 255
+MAX_RETRIES = 3
+
+USERNAME_PATTERN = r"^[A-Za-z0-9_.-]{3,32}$"
+MIN_PASSWORD_LENGTH = 8
+MAX_PASSWORD_LENGTH = 128
 
 
 class TaskStatus(str, Enum):
@@ -28,6 +33,13 @@ class TaskType(str, Enum):
 # ---------------------------------------------------------------------------
 # Requests
 # ---------------------------------------------------------------------------
+
+
+class UserCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(pattern=USERNAME_PATTERN, description="3-32 letters, digits, _ . -")
+    password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=MAX_PASSWORD_LENGTH)
 
 
 class TextPayload(BaseModel):
@@ -77,12 +89,25 @@ TaskCreate = Annotated[
 # ---------------------------------------------------------------------------
 
 
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    created_at: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(description="Seconds until the token expires")
+
+
 class TaskResponse(BaseModel):
     id: str
     type: TaskType
     status: TaskStatus
     idempotency_key: str | None = None
     error: str | None = None
+    retry_count: int = 0
     created_at: str
     started_at: str | None = None
     completed_at: str | None = None

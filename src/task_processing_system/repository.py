@@ -1,13 +1,20 @@
 """All database access for tasks lives here.
 
 Concurrency notes:
-  * Idempotency is enforced by the UNIQUE constraint on idempotency_key.
+  * Idempotency is enforced by the UNIQUE (user_id, idempotency_key) constraint (keys are per user).
     We insert first and handle IntegrityError, instead of "check then insert",
     which would be racy when two identical requests arrive together.
   * State changes are single conditional UPDATEs
     (``... WHERE id = ? AND status = 'pending'``) and we look at rowcount to
     see whether we won. That makes claim-vs-cancel race-safe: exactly one of
     the worker or the cancel request can move a pending task.
+
+Ownership:
+  Every task belongs to a user. Functions that serve API requests (create,
+  get, list, cancel, stats) REQUIRE a user_id and only ever touch that user's
+  rows; a task owned by someone else looks exactly like a task that does not
+  exist. Only the background-worker functions (claim, complete, fail, startup
+  recovery) work across all users, because workers serve everyone.
 
 SQL fragments built with f-strings only ever contain fixed text; every value
 goes through ``?`` placeholders.
@@ -19,10 +26,10 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Literal
-
+from .schemas import MAX_RETRIES, TaskStatus
 from .database import get_connection
 from .schemas import TaskStatus
 
@@ -33,12 +40,13 @@ FAILED = TaskStatus.FAILED.value
 CANCELLED = TaskStatus.CANCELLED.value
 
 CancelOutcome = Literal["cancelled", "not_found", "not_cancellable"]
-
+RetryOutcome = Literal["retried", "not_found", "not_failed", "limit_reached"]
 # Columns the API returns for status/list/cancel. payload and result are
 # deliberately left out: they can be ~1 MB each, and parsing them on the event
 # loop for a response that never includes them freezes the server.
 SUMMARY_COLUMNS = (
-    "id, idempotency_key, type, status, error, created_at, started_at, completed_at"
+    "id, idempotency_key, type, status, error, retry_count, "
+    "created_at, started_at, completed_at"
 )
 
 
@@ -49,6 +57,10 @@ class IdempotencyConflictError(Exception):
         super().__init__(f"Idempotency key {key!r} was already used with a different request")
         self.task_id = task_id
         self.key = key
+
+
+class UsernameTakenError(Exception):
+    """A user with this username (case-insensitive) already exists."""
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +97,63 @@ def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
 
 
 async def _fetch(
-    conn: Any, task_id: str, columns: str = SUMMARY_COLUMNS
+    conn: Any,
+    task_id: str,
+    columns: str = SUMMARY_COLUMNS,
+    user_id: str | None = None,
 ) -> dict[str, Any] | None:
+    """Fetch one task. With ``user_id`` only that user's task can be found."""
     # `columns` only ever comes from constants in this file, never user input.
-    cursor = await conn.execute(f"SELECT {columns} FROM tasks WHERE id = ?", (task_id,))
+    sql = f"SELECT {columns} FROM tasks WHERE id = ?"
+    params: list[Any] = [task_id]
+    if user_id is not None:
+        sql += " AND user_id = ?"
+        params.append(user_id)
+    cursor = await conn.execute(sql, params)
     row = await cursor.fetchone()
     return _row_to_task(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+
+async def create_user(username: str, password_hash: str) -> dict[str, Any]:
+    """Create a user. Raises UsernameTakenError if the name exists (any case)."""
+    user_id = str(uuid.uuid4())
+    created_at = utc_now()
+    async with get_connection() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, username, password_hash, created_at),
+            )
+            await conn.commit()
+        except sqlite3.IntegrityError as exc:
+            await conn.rollback()
+            raise UsernameTakenError(username) from exc
+    return {"id": user_id, "username": username, "created_at": created_at}
+
+
+async def get_user_by_username(username: str) -> dict[str, Any] | None:
+    """Includes password_hash: only for the login check, never return it to clients."""
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, username, password_hash, created_at FROM users WHERE username = ?",
+            (username,),  # column is COLLATE NOCASE, so this match ignores case
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_user_by_id(user_id: str) -> dict[str, Any] | None:
+    async with get_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, username, created_at FROM users WHERE id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -99,14 +162,15 @@ async def _fetch(
 
 
 async def create_task(
+    user_id: str,
     task_type: Any,
     payload: dict[str, Any],
     idempotency_key: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Insert a pending task.
 
-    Returns ``(task, created)``. ``created`` is False when an earlier task with
-    the same idempotency key and the same request body already exists, in
+    Returns ``(task, created)``. ``created`` is False when an earlier task of the
+    same user with the same idempotency key and request body already exists, in
     which case that existing task is returned. Raises IdempotencyConflictError
     if the key exists but the request body differs.
     """
@@ -119,11 +183,12 @@ async def create_task(
             await conn.execute(
                 """
                 INSERT INTO tasks
-                    (id, idempotency_key, request_hash, type, status, payload, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, user_id, idempotency_key, request_hash, type, status, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
+                    user_id,
                     idempotency_key,
                     request_hash,
                     task_type,
@@ -138,8 +203,9 @@ async def create_task(
             if idempotency_key is None:
                 raise
             cursor = await conn.execute(
-                f"SELECT request_hash, {SUMMARY_COLUMNS} FROM tasks WHERE idempotency_key = ?",
-                (idempotency_key,),
+                f"SELECT request_hash, {SUMMARY_COLUMNS} FROM tasks "
+                "WHERE user_id = ? AND idempotency_key = ?",
+                (user_id, idempotency_key),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -153,34 +219,59 @@ async def create_task(
         return task, True
 
 
-async def get_task(task_id: str) -> dict[str, Any] | None:
-    """Task summary (no payload or result)."""
+async def retry_task(
+    task_id: str, user_id: str, max_retries: int = MAX_RETRIES
+) -> tuple[RetryOutcome, dict[str, Any] | None]:
+    """Move one of the user's failed tasks back to pending, up to ``max_retries`` times.
+
+    A single conditional UPDATE, so two simultaneous retry requests cannot both win.
+    """
     async with get_connection() as conn:
-        return await _fetch(conn, task_id)
+        cursor = await conn.execute(
+            "UPDATE tasks SET status = ?, error = NULL, started_at = NULL, "
+            "completed_at = NULL, retry_count = retry_count + 1 "
+            "WHERE id = ? AND user_id = ? AND status = ? AND retry_count < ?",
+            (PENDING, task_id, user_id, FAILED, max_retries),
+        )
+        await conn.commit()
+        task = await _fetch(conn, task_id, user_id=user_id)
+        if cursor.rowcount == 1:
+            return "retried", task
+        if task is None:
+            return "not_found", None
+        if task["status"] != FAILED:
+            return "not_failed", task
+        return "limit_reached", task
+
+async def get_task(task_id: str, user_id: str) -> dict[str, Any] | None:
+    """Task summary (no payload or result), only if it belongs to ``user_id``."""
+    async with get_connection() as conn:
+        return await _fetch(conn, task_id, user_id=user_id)
 
 
-async def get_task_result(task_id: str) -> dict[str, Any] | None:
+async def get_task_result(task_id: str, user_id: str) -> dict[str, Any] | None:
     """Task summary plus the parsed result. Used only by /tasks/{id}/result."""
     async with get_connection() as conn:
-        return await _fetch(conn, task_id, f"{SUMMARY_COLUMNS}, result")
+        return await _fetch(conn, task_id, f"{SUMMARY_COLUMNS}, result", user_id=user_id)
 
 
 async def list_tasks(
+    user_id: str,
     status: Any = None,
     task_type: Any = None,
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Return ``(items, total)``, newest first. ``total`` ignores limit/offset."""
-    conditions: list[str] = []
-    params: list[Any] = []
+    """Return ``(items, total)`` for one user, newest first. ``total`` ignores limit/offset."""
+    conditions: list[str] = ["user_id = ?"]
+    params: list[Any] = [user_id]
     if status is not None:
         conditions.append("status = ?")
         params.append(_value(status))
     if task_type is not None:
         conditions.append("type = ?")
         params.append(_value(task_type))
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    where = f"WHERE {' AND '.join(conditions)}"
 
     async with get_connection() as conn:
         cursor = await conn.execute(f"SELECT COUNT(*) FROM tasks {where}", params)
@@ -217,15 +308,18 @@ async def claim_task(task_id: str) -> dict[str, Any] | None:
         return await _fetch(conn, task_id, f"{SUMMARY_COLUMNS}, payload")
 
 
-async def cancel_task(task_id: str) -> tuple[CancelOutcome, dict[str, Any] | None]:
-    """Cancel a task only if it is still pending."""
+async def cancel_task(
+    task_id: str, user_id: str
+) -> tuple[CancelOutcome, dict[str, Any] | None]:
+    """Cancel one of the user's tasks, only if it is still pending."""
     async with get_connection() as conn:
         cursor = await conn.execute(
-            "UPDATE tasks SET status = ?, completed_at = ? WHERE id = ? AND status = ?",
-            (CANCELLED, utc_now(), task_id, PENDING),
+            "UPDATE tasks SET status = ?, completed_at = ? "
+            "WHERE id = ? AND user_id = ? AND status = ?",
+            (CANCELLED, utc_now(), task_id, user_id, PENDING),
         )
         await conn.commit()
-        task = await _fetch(conn, task_id)
+        task = await _fetch(conn, task_id, user_id=user_id)
         if cursor.rowcount == 1:
             return "cancelled", task
         if task is None:
@@ -262,16 +356,27 @@ async def fail_task(task_id: str, error: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def reset_stale_processing() -> int:
-    """Put tasks left in 'processing' by a crash back to 'pending'.
+async def reset_stale_processing(older_than_seconds: float = 0) -> int:
+    """Put abandoned 'processing' tasks back to 'pending'.
+
+    Only tasks that have been processing for at least ``older_than_seconds``
+    are reset. With several server processes sharing one database, resetting
+    every 'processing' row at startup would steal tasks that another live
+    process is running right now (they would then run twice). The age
+    threshold leaves those alone; it must be longer than any task normally
+    takes. A threshold of 0 resets everything (single-process behaviour).
 
     Processing is deterministic and side-effect free, so re-running is safe.
     Returns how many tasks were reset.
     """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+    ).isoformat(timespec="milliseconds")
     async with get_connection() as conn:
         cursor = await conn.execute(
-            "UPDATE tasks SET status = ?, started_at = NULL WHERE status = ?",
-            (PENDING, PROCESSING),
+            "UPDATE tasks SET status = ?, started_at = NULL "
+            "WHERE status = ? AND started_at <= ?",
+            (PENDING, PROCESSING, cutoff),
         )
         await conn.commit()
         return cursor.rowcount
@@ -291,18 +396,23 @@ async def get_pending_ids() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-async def get_stats() -> dict[str, Any]:
+async def get_stats(user_id: str) -> dict[str, Any]:
+    """Statistics for one user's tasks."""
     async with get_connection() as conn:
-        cursor = await conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status")
+        cursor = await conn.execute(
+            "SELECT status, COUNT(*) AS n FROM tasks WHERE user_id = ? GROUP BY status",
+            (user_id,),
+        )
         counts = {row["status"]: row["n"] for row in await cursor.fetchall()}
 
         cursor = await conn.execute(
             """
             SELECT AVG((julianday(completed_at) - julianday(started_at)) * 86400.0)
               FROM tasks
-             WHERE status = ? AND started_at IS NOT NULL AND completed_at IS NOT NULL
+             WHERE user_id = ? AND status = ?
+               AND started_at IS NOT NULL AND completed_at IS NOT NULL
             """,
-            (COMPLETED,),
+            (user_id, COMPLETED),
         )
         average = (await cursor.fetchone())[0]
 

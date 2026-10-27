@@ -10,6 +10,8 @@ from typing import AsyncIterator
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from . import security
+from .auth import router as auth_router
 from .database import init_db
 from .routes import router
 from .worker import TaskWorkerPool
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    security.check_security_config()
     await init_db()
     pool = TaskWorkerPool()
     await pool.start()
@@ -31,10 +34,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Asynchronous Task Processing System",
-    description="Submit text and transaction analysis jobs, then poll for results.",
-    version="1.0.0",
+    description=(
+        "Submit text and transaction analysis jobs, then poll for results. "
+        "Register and log in first (use the Authorize button), then call the task endpoints."
+    ),
+    version="2.0.0",
     lifespan=lifespan,
 )
+app.include_router(auth_router)
 app.include_router(router)
 
 
